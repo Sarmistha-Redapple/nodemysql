@@ -38,6 +38,9 @@ Port notes:
 - If `PORT` is not set, the server picks a free port from `3000` to `3100`.
 - If `PORT` is set, it must be free (unique) on your machine.
 
+Rate limit:
+- `POST /register` and `POST /api/register` are limited to **2 requests per minute per IP**.
+
 ## phpMyAdmin login (Docker network fix)
 
 If phpMyAdmin shows error like:
@@ -47,7 +50,7 @@ It means you created `appuser@localhost` but phpMyAdmin is coming from a Docker 
 Create a user allowed from any host (`%`) using this project (uses `DB_*` from `.env`):
 
 ```bash
-npm run create:pmauser -- --pma-user appuser --pma-pass 'AppPass123!' --pma-host '%'
+npm run create:root -- --pma-user appuser --pma-pass 'AppPass123!' --pma-host '%'
 ```
 
 ## 3) Install + run
@@ -63,6 +66,33 @@ Test with curl:
 curl -sS -X POST 'http://localhost:<port>/api/register' \
   -H 'Content-Type: application/json' \
   -d '{"name":"Alice","email":"alice@example.com","phone":"9999999999","address":"Pune","password":"secret12"}'
+```
+
+Login with curl:
+
+```bash
+curl -sS -X POST 'http://localhost:<port>/api/login' \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"alice@example.com","password":"secret12"}' \
+  -c cookies.txt
+```
+
+Login response includes token + refresh token (refresh token is also stored in an HttpOnly cookie):
+
+```json
+{ "ok": true, "token": "...", "refreshToken": "..." }
+```
+
+Refresh access token (uses cookie):
+
+```bash
+curl -sS -X POST 'http://localhost:<port>/api/refresh' -b cookies.txt -c cookies.txt
+```
+
+Logout (revokes refresh token and clears cookie):
+
+```bash
+curl -sS -X POST 'http://localhost:<port>/api/logout' -b cookies.txt -c cookies.txt
 ```
 
 Then fetch details:
