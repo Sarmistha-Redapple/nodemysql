@@ -157,6 +157,23 @@ function getCookie(req, name) {
   return null;
 }
 
+async function saveRefreshTokenForUser(userId, tokenHash, expiresAt) {
+  // Keep exactly one "active" refresh token per user by updating if the user already has a row.
+  // If duplicates already exist, UPDATE will rotate all of them to the new token, effectively invalidating older tokens.
+  const [result] = await pool.execute("UPDATE refresh_tokens SET token_hash = ?, expires_at = ? WHERE user_id = ?", [
+    tokenHash,
+    expiresAt,
+    userId
+  ]);
+  if (result.affectedRows > 0) return;
+
+  await pool.execute("INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)", [
+    userId,
+    tokenHash,
+    expiresAt
+  ]);
+}
+
 app.get("/", (req, res) => {
   res.json({
     status: true,
@@ -210,10 +227,7 @@ async function handleLogin(req, res) {
     const refreshTtlSeconds = Number(process.env.REFRESH_TOKEN_TTL_SECONDS || 60 * 60 * 24 * 30);
     const expiresAt = new Date(Date.now() + refreshTtlSeconds * 1000);
 
-    await pool.execute(
-      "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
-      [safeUser.id, refreshToken, expiresAt]
-    );
+    await saveRefreshTokenForUser(safeUser.id, refreshToken, expiresAt);
 
     res.cookie(getRefreshCookieName(), refreshToken, refreshCookieOptions());
     const accessToken = createAccessToken(safeUser);
@@ -250,15 +264,10 @@ async function handleRefresh(req, res) {
     }
 
     // Rotate refresh token
-    await pool.execute("DELETE FROM refresh_tokens WHERE id = ?", [row.refresh_id]);
-
     const newRefresh = generateRefreshToken();
     const refreshTtlSeconds = Number(process.env.REFRESH_TOKEN_TTL_SECONDS || 60 * 60 * 24 * 30);
     const expiresAt = new Date(Date.now() + refreshTtlSeconds * 1000);
-    await pool.execute(
-      "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
-      [row.user_id, newRefresh, expiresAt]
-    );
+    await saveRefreshTokenForUser(row.user_id, newRefresh, expiresAt);
 
     res.cookie(cookieName, newRefresh, refreshCookieOptions());
 
@@ -502,6 +511,21 @@ async function ensureSchema() {
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
       )
     `);
+
+    // Optional hardening: dedupe rows so there is only one refresh token row per user.
+    // This keeps behavior consistent even if older versions inserted multiple rows.
+    try {
+      await pool.execute(`
+        DELETE rt_old
+        FROM refresh_tokens rt_old
+        JOIN refresh_tokens rt_new
+          ON rt_old.user_id = rt_new.user_id
+         AND rt_old.id < rt_new.id
+      `);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn("Warning: refresh_tokens cleanup skipped:", err && err.code ? err.code : err);
+    }
   } catch (err) {
     if (err && err.code === "ER_BAD_DB_ERROR") {
       throw new Error(
