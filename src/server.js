@@ -2,13 +2,14 @@ const bcrypt = require("bcryptjs");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const express = require("express");
-const rateLimit = require("express-rate-limit");
 const net = require("net");
 const crypto = require("crypto");
 
 dotenv.config();
 
-const { pool, query } = require("./db");
+const { executeSql, querySql } = require("./db");
+const { ensureSchema } = require("./schema");
+const { registerRoutes } = require("./routes");
 
 const app = express();
 
@@ -160,39 +161,11 @@ function getCookie(req, name) {
 async function saveRefreshTokenForUser(userId, tokenHash, expiresAt) {
   // Keep exactly one "active" refresh token per user by updating if the user already has a row.
   // If duplicates already exist, UPDATE will rotate all of them to the new token, effectively invalidating older tokens.
-  const [result] = await pool.execute("UPDATE refresh_tokens SET token_hash = ?, expires_at = ? WHERE user_id = ?", [
-    tokenHash,
-    expiresAt,
-    userId
-  ]);
+  const result = await executeSql("queries/refresh_tokens/update_by_user_id", [tokenHash, expiresAt, userId]);
   if (result.affectedRows > 0) return;
 
-  await pool.execute("INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)", [
-    userId,
-    tokenHash,
-    expiresAt
-  ]);
+  await executeSql("queries/refresh_tokens/insert", [userId, tokenHash, expiresAt]);
 }
-
-app.get("/", (req, res) => {
-  res.json({
-    status: true,
-    message: "Node + MySQL API is running.",
-    routes: {
-      register: "POST /register",
-      apiRegister: "POST /api/register",
-      login: "POST /login",
-      apiLogin: "POST /api/login",
-      refresh: "POST /api/refresh",
-      logout: "POST /api/logout",
-      authLogin: "POST /api/auth/login",
-      authRefresh: "POST /api/auth/refresh",
-      authLogout: "POST /api/auth/logout",
-      userById: "GET /users/:id",
-      users: "GET /api/users"
-    }
-  });
-});
 
 async function handleLogin(req, res) {
   const email = String(req.body.email ?? "").trim().toLowerCase();
@@ -206,10 +179,7 @@ async function handleLogin(req, res) {
   }
 
   try {
-    const rows = await query(
-      "SELECT id, name, email, phone, address, password_hash, created_at FROM users WHERE email = ? LIMIT 1",
-      [email]
-    );
+    const rows = await querySql("queries/users/select_by_email", [email]);
     const user = rows[0];
     if (!user) {
       return res.status(401).json({ status: false, error: "invalid_credentials", message: "Invalid email or password." });
@@ -247,17 +217,7 @@ async function handleRefresh(req, res) {
   }
 
   try {
-    const rows = await query(
-      `
-        SELECT rt.id AS refresh_id, rt.user_id, u.id, u.name, u.email, u.phone, u.address, u.created_at
-        FROM refresh_tokens rt
-        JOIN users u ON u.id = rt.user_id
-        WHERE rt.token_hash = ?
-          AND rt.expires_at > NOW()
-        LIMIT 1
-      `,
-      [raw]
-    );
+    const rows = await querySql("queries/refresh_tokens/select_by_token", [raw]);
     const row = rows[0];
     if (!row) {
       return res.status(401).json({ status: false, error: "not_authenticated", message: "Invalid refresh token." });
@@ -293,7 +253,7 @@ async function handleLogout(req, res) {
   const raw = getCookie(req, cookieName);
   if (raw) {
     try {
-      await pool.execute("DELETE FROM refresh_tokens WHERE token_hash = ?", [raw]);
+      await executeSql("queries/refresh_tokens/delete_by_token_hash", [raw]);
     } catch (err) {
       // eslint-disable-next-line no-console
       console.error(err);
@@ -329,10 +289,7 @@ async function handleRegister(req, res) {
 
   try {
     const passwordHash = await bcrypt.hash(password, 10);
-    const [result] = await pool.execute(
-      "INSERT INTO users (name, email, phone, address, password_hash) VALUES (?, ?, ?, ?, ?)",
-      [name, email, phone, address, passwordHash]
-    );
+    const result = await executeSql("queries/users/insert", [name, email, phone, address, passwordHash]);
 
     res.status(201).json({
       status: true,
@@ -352,102 +309,7 @@ async function handleRegister(req, res) {
   }
 }
 
-const registerLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  limit: 2,
-  skipFailedRequests: true,
-  standardHeaders: true,
-  legacyHeaders: false,
-  handler(req, res, next, options) {
-    const limit = req.rateLimit?.limit ?? options.limit;
-    const used = req.rateLimit?.used;
-    const remaining = req.rateLimit?.remaining;
-    const resetTime = req.rateLimit?.resetTime;
-    const retryAfterSeconds = Math.max(
-      1,
-      Math.ceil(((resetTime?.getTime?.() ?? Date.now()) - Date.now()) / 1000)
-    );
-    res.status(options.statusCode).json({
-      status: false,
-      error: "rate_limit_exceeded",
-      message: "Only 2 registration requests allowed per minute. Please try again later.",
-      retryAfterSeconds,
-      limit,
-      used,
-      remaining,
-      resetTime: resetTime ? resetTime.toISOString() : undefined
-    });
-  }
-});
-
-const loginLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  limit: 10,
-  skipFailedRequests: false,
-  standardHeaders: true,
-  legacyHeaders: false,
-  handler(req, res, next, options) {
-    const resetTime = req.rateLimit?.resetTime;
-    const retryAfterSeconds = Math.max(
-      1,
-      Math.ceil(((resetTime?.getTime?.() ?? Date.now()) - Date.now()) / 1000)
-    );
-    res.status(options.statusCode).json({
-      status: false,
-      error: "rate_limit_exceeded",
-      message: "Too many login attempts. Please try again later.",
-      retryAfterSeconds
-    });
-  }
-});
-
-app.post("/login", loginLimiter, handleLogin);
-app.post("/api/login", loginLimiter, handleLogin);
-app.post("/api/auth/login", loginLimiter, handleLogin);
-app.post("/api/refresh", handleRefresh);
-app.post("/api/auth/refresh", handleRefresh);
-app.post("/api/logout", handleLogout);
-app.post("/api/auth/logout", handleLogout);
-
-app.post("/register", registerLimiter, handleRegister);
-app.post("/api/register", registerLimiter, handleRegister);
-
-app.get("/users/:id", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isInteger(id) || id <= 0) {
-    return res.status(400).json({ status: false, error: "validation_error", message: "Invalid id." });
-  }
-
-  try {
-    const rows = await query(
-      "SELECT id, name, email, phone, address, created_at FROM users WHERE id = ?",
-      [id]
-    );
-    const user = rows[0];
-    if (!user) return res.status(404).json({ status: false, error: "not_found", message: "User not found." });
-
-    res.json({ status: true, user });
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.error(err);
-    res.status(500).json({ status: false, error: "server_error", message: "Server error." });
-  }
-});
-
-// Optional: see saved users (JSON)
-app.get("/api/users", async (req, res) => {
-  try {
-    const rows = await query(
-      "SELECT id, name, email, phone, address, created_at FROM users ORDER BY id DESC",
-      []
-    );
-    res.json({ status: true, users: rows });
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.error(err);
-    res.status(500).json({ status: false, error: "server_error", message: "Server error." });
-  }
-});
+registerRoutes(app, { querySql, handleLogin, handleRefresh, handleLogout, handleRegister });
 
 function isPortFree(port, host = "127.0.0.1") {
   return new Promise((resolve) => {
@@ -483,57 +345,6 @@ async function pickUniquePort() {
 
   // Fallback: let the OS pick any free port.
   return 0;
-}
-
-async function ensureSchema() {
-  try {
-    await pool.execute(`
-      CREATE TABLE IF NOT EXISTS users (
-        id INT UNSIGNED NOT NULL AUTO_INCREMENT,
-        name VARCHAR(100) NOT NULL,
-        email VARCHAR(191) NOT NULL,
-        phone VARCHAR(30) NULL,
-        address VARCHAR(255) NULL,
-        password_hash VARCHAR(255) NOT NULL,
-        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (id),
-        UNIQUE KEY uniq_users_email (email)
-      )
-    `);
-
-    await pool.execute(`
-      CREATE TABLE IF NOT EXISTS refresh_tokens (
-        id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-        user_id INT UNSIGNED NOT NULL,
-        token_hash VARCHAR(500) NOT NULL,
-        expires_at DATETIME NOT NULL,
-        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-      )
-    `);
-
-    // Optional hardening: dedupe rows so there is only one refresh token row per user.
-    // This keeps behavior consistent even if older versions inserted multiple rows.
-    try {
-      await pool.execute(`
-        DELETE rt_old
-        FROM refresh_tokens rt_old
-        JOIN refresh_tokens rt_new
-          ON rt_old.user_id = rt_new.user_id
-         AND rt_old.id < rt_new.id
-      `);
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.warn("Warning: refresh_tokens cleanup skipped:", err && err.code ? err.code : err);
-    }
-  } catch (err) {
-    if (err && err.code === "ER_BAD_DB_ERROR") {
-      throw new Error(
-        `Database "${process.env.DB_NAME}" not found. Create it (run sql/init.sql) or start docker-compose.`
-      );
-    }
-    throw err;
-  }
 }
 
 async function main() {
